@@ -24,6 +24,7 @@
 #include <linux/fs.h>
 #include <linux/capability.h>
 #include <linux/eventpoll.h>
+#include <linux/dma-buf.h>
 #include <media/v4l2-ioctl.h>
 #include <media/v4l2-common.h>
 #include <media/v4l2-device.h>
@@ -66,6 +67,8 @@ MODULE_VERSION("" __stringify(V4L2LOOPBACK_VERSION_MAJOR) "." __stringify(
 	V4L2LOOPBACK_VERSION_MINOR) "." __stringify(V4L2LOOPBACK_VERSION_BUGFIX));
 #endif
 MODULE_LICENSE("GPL");
+
+MODULE_IMPORT_NS(DMA_BUF);
 
 /*
  * helpers
@@ -1586,7 +1589,9 @@ static int vidioc_reqbufs(struct file *file, void *fh,
 	}
 
 	init_buffers(dev);
+	/* if using memory-mapped IO, configure the out-buffer list */
 	switch (b->memory) {
+	case V4L2_MEMORY_DMABUF:
 	case V4L2_MEMORY_MMAP:
 		/* do nothing here, buffers are always allocated */
 		if (b->count < 1 || dev->buffers_number < 1)
@@ -1899,6 +1904,84 @@ static int vidioc_dqbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 	default:
 		return -EINVAL;
 	}
+}
+
+static struct sg_table *map_v4l2l_dmabuf(struct dma_buf_attachment *at,
+					 enum dma_data_direction direction)
+{
+	return 0;
+}
+
+static void unmap_v4l2l_dmabuf(struct dma_buf_attachment *at,
+			       struct sg_table *sg,
+			       enum dma_data_direction direction)
+{
+}
+
+static void release_v4l2l_dmabuf(struct dma_buf *buf)
+{
+}
+
+static int mmap_v4l2l_dmabuf(struct dma_buf *buf, struct vm_area_struct *vma)
+{
+	return 0;
+}
+
+static const struct dma_buf_ops v4l2l_dmabuf_ops = {
+	.cache_sgt_mapping = true,
+	.map_dma_buf = map_v4l2l_dmabuf,
+	.unmap_dma_buf = unmap_v4l2l_dmabuf,
+	.release = release_v4l2l_dmabuf,
+	.mmap = mmap_v4l2l_dmabuf,
+};
+
+static int vidioc_expbuf(struct file *file, void *fh,
+			 struct v4l2_exportbuffer *exp_buf)
+{
+	struct v4l2_loopback_device *dev;
+	struct v4l2_loopback_opener *opener;
+	struct v4l2l_buffer *b;
+
+	MARK();
+
+	dev = v4l2loopback_getdevice(file);
+	opener = fh_to_opener(fh);
+
+	if (exp_buf->index < 0 || exp_buf->index >= dev->buffers_number)
+		return -EINVAL;
+	if (exp_buf->plane != 0)
+		return -EINVAL;
+	if (exp_buf->flags & !(O_CLOEXEC | (O_ACCMODE & !O_PATH)))
+		return -EINVAL;
+	if (exp_buf->type &
+	    !(V4L2_BUF_TYPE_VIDEO_CAPTURE | V4L2_BUF_TYPE_VIDEO_OUTPUT))
+		return -EINVAL;
+
+	b = &dev->buffers[exp_buf->index];
+	if (b->buffer.memory != V4L2_MEMORY_MMAP)
+		return -EINVAL;
+
+	if (b->buffer.flags & V4L2_BUF_FLAG_MAPPED) {
+		dprintk("cannot export mapped buffer[%d]\n", exp_buf->index);
+		return -EINVAL;
+	}
+
+	DEFINE_DMA_BUF_EXPORT_INFO(exp_info);
+	exp_info.ops = &v4l2l_dmabuf_ops;
+	exp_info.size = dev->buffer_size;
+	exp_info.flags = O_RDWR; // FIXME: non-block, too?
+	exp_info.priv = b;
+
+	struct dma_buf *dma_buf = dma_buf_export(&exp_info);
+	if (IS_ERR(dma_buf))
+		return PTR_ERR(dma_buf);
+
+	int result = dma_buf_fd(dma_buf, exp_buf->flags);
+	if (result < 0)
+		return result;
+
+	exp_buf->fd = result;
+	return 0;
 }
 
 /* ------------- STREAMING ------------------- */
@@ -3034,9 +3117,11 @@ static const struct v4l2_ioctl_ops v4l2_loopback_ioctl_ops = {
 	.vidioc_querybuf		= &vidioc_querybuf,
 	.vidioc_qbuf			= &vidioc_qbuf,
 	.vidioc_dqbuf			= &vidioc_dqbuf,
+	.vidioc_expbuf			= &vidioc_expbuf,
 
 	.vidioc_streamon		= &vidioc_streamon,
 	.vidioc_streamoff		= &vidioc_streamoff,
+
 
 #ifdef CONFIG_VIDEO_V4L1_COMPAT
 	.vidiocgmbuf			= &vidiocgmbuf,
